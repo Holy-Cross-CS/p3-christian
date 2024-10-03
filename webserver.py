@@ -45,6 +45,8 @@ from typing import List
 import datetime
 from datetime import datetime as dt
 import uuid
+import sqlite3
+
 
 # Global configuration variables.
 # These never change once the server has finished initializing, so they don't
@@ -61,13 +63,45 @@ banned_user_agents = [
 
 hello_count = 0
 
+
+def create_tables():
+    with sqlite3.connect("app.db") as db:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS topics (
+                name TEXT PRIMARY KEY,
+                msg_cnt INTEGER,
+                likes INTEGER
+            )
+            """
+        )
+
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                content TEXT,
+                created_at TEXT,
+                topic TEXT,
+                FOREIGN KEY (topic) REFERENCES topics(name)
+            )
+            """
+        )
+
+
+create_tables()
+
+
 @dataclass
 class Message:
     content: str
     id_: str
     created_at: dt.time = dt.now()
 
+
 "https://stackoverflow.com/questions/52063759/passing-default-list-argument-to-dataclasses"
+
+
 @dataclass
 class Topic:
     name: str
@@ -83,7 +117,7 @@ class Topic:
         self.msgs.remove(msg)
         self.msg_cnt -= 1
 
-    def remove(self, id_: uuid.UUID):
+    def remove(self, id_: str):
         for msg in self.msgs:
             if msg.id_ == id_:
                 self.msgs.remove(msg)
@@ -91,9 +125,84 @@ class Topic:
                 return
 
 
-topic_version: int = 0
+class TopicRepo:
+    def __init__(self):
+        self.topics: dict[str, Topic] = {}
+        self.version: int = 0
 
-topics: dict[str, Topic] = {"whatever": Topic("whatever", 7, 2), "holycross": Topic("holycross", 15, 6)}
+    def add(self, topic: Topic) -> None:
+        self.topics[topic.name] = topic
+        self.version += 1
+
+        with sqlite3.connect("app.db") as db:
+            db.execute(
+                "INSERT INTO topics (name, msg_cnt, likes) VALUES (?, ?, ?)",
+                (topic.name, topic.msg_cnt, topic.likes),
+            )
+            
+            db.commit()
+
+    def add_message(self, topic: str, msg: Message) -> None:
+        topic = self.get(topic)
+        topic.update(msg)
+        self.version += 1
+
+        with sqlite3.connect("app.db") as db:
+            db.execute(
+                "INSERT INTO messages (id, content, created_at, topic) VALUES (?, ?, ?, ?)",
+                (msg.id_, msg.content, msg.created_at, topic.name),
+            )
+            db.commit()
+
+    def remove_message(self, topic: str, id_: str):
+        topic_ = self.topics[topic]
+        topic_.remove(id_)
+        self.version += 1
+
+        with sqlite3.connect("app.db") as db:
+            db.execute("DELETE FROM messages WHERE id = ?", (id_,))
+            db.commit()
+
+    def remove(self, name: str):
+        self.topics.pop(name)
+        self.version += 1
+
+        with sqlite3.connect("app.db") as db:
+            db.execute("DELETE FROM topics WHERE name = ?", (name,))
+
+    def load_all(self):
+        with sqlite3.connect("app.db") as db:
+            cursor = db.execute("SELECT * FROM topics")
+            rows = cursor.fetchall()
+            for row in rows:
+                topic = Topic(row[0], row[1], row[2])
+                self.topics[row[0]] = topic
+
+            cursor = db.execute(
+                "SELECT topics.name, messages.id, messages.content, messages.created_at FROM topics JOIN messages ON topics.name = messages.topic"
+            )
+            rows = cursor.fetchall()
+            for row in rows:
+                topic = self.topics[row[0]]
+                created_at = dt.strptime(row[3], "%Y-%m-%d %H:%M:%S.%f")
+                topic.msgs.append(Message(row[2], row[1], created_at))
+
+    def get(self, name: str) -> Topic | None:
+        return self.topics.get(name)
+    
+    def like_topic(self, name: str):
+        topic = self.get(name)
+        topic.likes += 1
+        self.version += 1
+
+        with sqlite3.connect("app.db") as db:
+            db.execute(
+                "UPDATE topics SET likes = ? WHERE name = ?", (topic.likes, name)
+            )
+            db.commit()
+
+topic_repo = TopicRepo()
+topic_repo.load_all()
 
 
 # Global variables to keep track of statistics, with initial values. These get
@@ -565,32 +674,31 @@ def handle_http_post_hello(req: Request, conn: Connection) -> Response:
     cookies = {"name": name, "favcolor": color}
     return handle_http_get_hello(req, conn, cookies)
 
+
 def handle_http_post_whisper_messages(req: Request, conn: Connection) -> Response:
-    print(req.path)
-    print(req.body)
     body = req.body.split("\n")
     if body == 0:
         return Response("400 BAD REQUEST", "text/plain", "Malformed request")
-    
+
     tags = body[0].split()
     messages = body[1].split(maxsplit=1)
 
-    if len(messages) == 1: 
+    if len(messages) == 1:
         return Response("200 OK", "text/plain", "Not Harmful")
-    
+
     if len(tags) == 1:
         return Response("400 BAD REQUEST", "text/plain", "No tags provided")
-    
+
     for tag in tags[1:]:
-        if topics.get(tag):
-            topics[tag].update(Message(messages[1], f"{tag}-{str(uuid.uuid4())}"))
+        if topic_repo.get(tag):
+            topic_repo.add_message(tag, Message(messages[1], f"{tag}-{str(uuid.uuid4())}"))
         else:
-            topics[tag] = Topic(tag, 1, 0, [Message(messages[1], f"{tag}-{str(uuid.uuid4())}")])
-    
-    global topic_version 
-    topic_version += 1
+            topic_repo.add(
+                Topic(tag, 1, 0, [Message(messages[1], f"{tag}-{str(uuid.uuid4())}")])
+            )
 
     return Response("200 OK", "text/plain", "Message successfuly sent!")
+
 
 def handle_http_post(req, conn):
     if req.path == "/hello":
@@ -598,9 +706,9 @@ def handle_http_post(req, conn):
     elif req.path == "/whisper/messages":
         resp = handle_http_post_whisper_messages(req, conn)
     elif req.path.startswith("/whisper/like"):
-        resp = handle_http_get_whisper_like_topic(req, conn)  
+        resp = handle_http_get_whisper_like_topic(req, conn)
     elif req.path.startswith("/whisper/downvote"):
-        resp = handle_http_get_whisper_topics_downvote(req, conn) 
+        resp = handle_http_get_whisper_topics_downvote(req, conn)
     else:
         resp = Response(
             "405 METHOD NOT ALLOWED",
@@ -631,21 +739,19 @@ def handle_http_get_status(conn):
     )
     return Response("200 OK", "text/plain", msg)
 
+
 def handle_http_get_whisper_like_topic(req: Request, conn: Connection) -> Response:
     log("Handling http get whisper like topic request")
     topic = req.path.split("/")[-1]
-    topics[topic].likes += 1
-    global topic_version
-    topic_version += 1
+    topic_repo.like_topic(topic)
     return Response("200 OK", "text/plain", "Success")
+
 
 def handle_http_get_whisper_topics_downvote(req: Request, conn: Connection) -> Response:
     log("Handling http get whisper topic downvote request")
     id_ = req.path.split("/")[-1].split("-", maxsplit=1)[1]
     topic = id_.split("-", maxsplit=1)[0]
-    topics[topic].remove(id_)
-    global topic_version
-    topic_version += 1
+    topic_repo.remove_message(topic, id_)
     return Response("200 OK", "text/plain", "Success")
 
 
@@ -654,35 +760,32 @@ def handle_http_get_whisper_topics_feed(req: Request, conn: Connection) -> Respo
     version = int(req.path.split("=")[-1])
     msg = f"{version}\n"
 
-    while topic_version < version:
+    while topic_repo.version < version:
         pass
 
     topic = req.path.split("/")[-1].split("?")[0]
-    topic_obj = topics[topic]
     ten_minutes_ago = dt.now() - datetime.timedelta(minutes=10)
 
-    for msg_ in topic_obj.msgs:
+    for msg_ in topic_repo.get(topic).msgs:
         # Remove message if it is older than 10 minutes
         if msg_.created_at <= ten_minutes_ago:
-            topic_obj.remove(msg_)
-            
+            topic_repo.remove_message(topic, msg_.id_)
 
         assert isinstance(msg_, Message)
         msg += f"-{msg_.id_} {msg_.content}\n"
 
-    # print(msg)
-
     return Response("200 OK", "text/plain", msg)
+
 
 def handle_http_get_whisper_topics(req: Request, conn: Connection) -> Response:
     log("Handling http get whisper topics request")
     version = int(req.path.split("=")[-1])
     msg = f"{version}\n"
 
-    while topic_version < version:
+    while topic_repo.version < version:
         pass
 
-    for _, topic in topics.items():
+    for _, topic in topic_repo.topics.items():
         msg += f"{topic.msg_cnt} {topic.likes} {topic.name}\n"
 
     return Response("200 OK", "text/plain", msg)
@@ -860,7 +963,7 @@ def handle_http_get(req, conn, cookies):
     elif req.path.startswith("/whisper/topics?version"):
         resp = handle_http_get_whisper_topics(req, conn)
     elif req.path.startswith("/whisper/feed"):
-        resp = handle_http_get_whisper_topics_feed(req, conn)   
+        resp = handle_http_get_whisper_topics_feed(req, conn)
     else:
         resp = handle_http_get_file(req.path)
     return resp
