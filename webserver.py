@@ -40,8 +40,11 @@ import threading  # for concurrent threads and locks
 import random  # for random numbers
 import re  # for regex split() to split up strings
 import string  # for various string operations
-from dataclasses import dataclass
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List
+import datetime
+from datetime import datetime as dt
+import uuid
 
 # Global configuration variables.
 # These never change once the server has finished initializing, so they don't
@@ -58,17 +61,39 @@ banned_user_agents = [
 
 hello_count = 0
 
+@dataclass
+class Message:
+    content: str
+    id_: str
+    created_at: dt.time = dt.now()
 
+"https://stackoverflow.com/questions/52063759/passing-default-list-argument-to-dataclasses"
 @dataclass
 class Topic:
     name: str
-    messages_count: int = 0
+    msg_cnt: int = 0
     likes: int = 0
+    msgs: List[Message] = field(default_factory=lambda: [])
+
+    def update(self, msg: Message):
+        self.msgs.append(msg)
+        self.msg_cnt += 1
+
+    def remove(self, msg: Message):
+        self.msgs.remove(msg)
+        self.msg_cnt -= 1
+
+    def remove(self, id_: uuid.UUID):
+        for msg in self.msgs:
+            if msg.id_ == id_:
+                self.msgs.remove(msg)
+                self.msg_cnt -= 1
+                return
 
 
 topic_version: int = 0
 
-topics: list[Topic] = [Topic("whatever", 7, 2), Topic("holycross", 15, 6)]
+topics: dict[str, Topic] = {"whatever": Topic("whatever", 7, 2), "holycross": Topic("holycross", 15, 6)}
 
 
 # Global variables to keep track of statistics, with initial values. These get
@@ -530,7 +555,7 @@ def send_http_response(conn, resp):
         conn.sock.sendall(body)
 
 
-def handle_http_post_hello(req: Request, conn):
+def handle_http_post_hello(req: Request, conn: Connection) -> Response:
     global hello_count
     hello_count += 1
     # Parse the request body
@@ -540,10 +565,42 @@ def handle_http_post_hello(req: Request, conn):
     cookies = {"name": name, "favcolor": color}
     return handle_http_get_hello(req, conn, cookies)
 
+def handle_http_post_whisper_messages(req: Request, conn: Connection) -> Response:
+    print(req.path)
+    print(req.body)
+    body = req.body.split("\n")
+    if body == 0:
+        return Response("400 BAD REQUEST", "text/plain", "Malformed request")
+    
+    tags = body[0].split()
+    messages = body[1].split(maxsplit=1)
+
+    if len(messages) == 1: 
+        return Response("200 OK", "text/plain", "Not Harmful")
+    
+    if len(tags) == 1:
+        return Response("400 BAD REQUEST", "text/plain", "No tags provided")
+    
+    for tag in tags[1:]:
+        if topics.get(tag):
+            topics[tag].update(Message(messages[1], f"{tag}-{str(uuid.uuid4())}"))
+        else:
+            topics[tag] = Topic(tag, 1, 0, [Message(messages[1], f"{tag}-{str(uuid.uuid4())}")])
+    
+    global topic_version 
+    topic_version += 1
+
+    return Response("200 OK", "text/plain", "Message successfuly sent!")
 
 def handle_http_post(req, conn):
     if req.path == "/hello":
         resp = handle_http_post_hello(req, conn)
+    elif req.path == "/whisper/messages":
+        resp = handle_http_post_whisper_messages(req, conn)
+    elif req.path.startswith("/whisper/like"):
+        resp = handle_http_get_whisper_like_topic(req, conn)  
+    elif req.path.startswith("/whisper/downvote"):
+        resp = handle_http_get_whisper_topics_downvote(req, conn) 
     else:
         resp = Response(
             "405 METHOD NOT ALLOWED",
@@ -574,8 +631,50 @@ def handle_http_get_status(conn):
     )
     return Response("200 OK", "text/plain", msg)
 
+def handle_http_get_whisper_like_topic(req: Request, conn: Connection) -> Response:
+    log("Handling http get whisper like topic request")
+    topic = req.path.split("/")[-1]
+    topics[topic].likes += 1
+    global topic_version
+    topic_version += 1
+    return Response("200 OK", "text/plain", "Success")
 
-def handle_http_get_whisper_topics(req: Request, conn: Connection):
+def handle_http_get_whisper_topics_downvote(req: Request, conn: Connection) -> Response:
+    log("Handling http get whisper topic downvote request")
+    id_ = req.path.split("/")[-1].split("-", maxsplit=1)[1]
+    topic = id_.split("-", maxsplit=1)[0]
+    topics[topic].remove(id_)
+    global topic_version
+    topic_version += 1
+    return Response("200 OK", "text/plain", "Success")
+
+
+def handle_http_get_whisper_topics_feed(req: Request, conn: Connection) -> Response:
+    log("Handling http get whisper topic feed request")
+    version = int(req.path.split("=")[-1])
+    msg = f"{version}\n"
+
+    while topic_version < version:
+        pass
+
+    topic = req.path.split("/")[-1].split("?")[0]
+    topic_obj = topics[topic]
+    ten_minutes_ago = dt.now() - datetime.timedelta(minutes=10)
+
+    for msg_ in topic_obj.msgs:
+        # Remove message if it is older than 10 minutes
+        if msg_.created_at <= ten_minutes_ago:
+            topic_obj.remove(msg_)
+            
+
+        assert isinstance(msg_, Message)
+        msg += f"-{msg_.id_} {msg_.content}\n"
+
+    # print(msg)
+
+    return Response("200 OK", "text/plain", msg)
+
+def handle_http_get_whisper_topics(req: Request, conn: Connection) -> Response:
     log("Handling http get whisper topics request")
     version = int(req.path.split("=")[-1])
     msg = f"{version}\n"
@@ -583,8 +682,8 @@ def handle_http_get_whisper_topics(req: Request, conn: Connection):
     while topic_version < version:
         pass
 
-    for topic in topics:
-        msg += f"{topic.messages_count} {topic.likes} {topic.name}\n"
+    for _, topic in topics.items():
+        msg += f"{topic.msg_cnt} {topic.likes} {topic.name}\n"
 
     return Response("200 OK", "text/plain", msg)
 
@@ -758,8 +857,10 @@ def handle_http_get(req, conn, cookies):
         resp = handle_http_get_quote()
     elif req.path == "/whoami":
         resp = handle_http_get_whoami(req, conn)
-    elif req.path.split("/")[1] == "whisper":
+    elif req.path.startswith("/whisper/topics?version"):
         resp = handle_http_get_whisper_topics(req, conn)
+    elif req.path.startswith("/whisper/feed"):
+        resp = handle_http_get_whisper_topics_feed(req, conn)   
     else:
         resp = handle_http_get_file(req.path)
     return resp
